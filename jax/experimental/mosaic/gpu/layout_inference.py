@@ -375,30 +375,37 @@ def _extract_layout_candidates_from_smem_registers_transfer(
     yield variable, cs.RegisterLayout(layout)
 
 
-def _extract_layout_candidates_from_mma_tiling(
-    mma_tiling: cs.IsValidMmaTiling,
-) -> Iterator[tuple[cs.Variable, cs.Constant]]:
-  v: cs.Variable
-  match mma_tiling.expr:
-    case cs.Variable() as var:
-      is_transposed = False
-      v = var
-    case cs.Transpose(cs.Variable() as var):
-      assert isinstance(var, cs.Variable)
-      is_transposed = True
-      v = var
-    case _:
-      return
+def mma_tiling_constraint(
+    var: cs.Variable,
+    allow_unswizzled: bool = False,
+) -> cs.Constraint:
+  """Returns a constraint stating that `var` has a valid MMA SMEM tiling.
 
-  tiled_dimensions = v.shape[-2:]
-  # TODO(bchetioui): we can conjure additional tilings here if
-  # `allow_unswizzled` is true, but it is not clear which ones yet.
-  for swizzle in (128, 64, 32):
-    swizzle_elems = swizzle * 8 // mma_tiling.bitwidth
+  For both tcgen05.mma and wgmma, tiling is valid if it is of the form
+  (8, swizzle_elems), with
+      swizzle_elems in {s * 8 // dtype_bitwidth for s in [32, 64, 128]},
+  as support for unswizzled tilings is not yet supported.
+
+  If `allow_unswizzled` is True, then we additionally accept
+  (8, 16 * 8 // dtype_bitwidth) as a valid tiling.
+
+  If `ref_type` is transposed, the tilings are transposed to
+  (swizzle_elems, 8).
+  """
+  ref_type = ir.MemRefType(var.key.value.type)
+  bitwidth = utils.bitwidth(ref_type.element_type)
+  is_transposed = utils.is_memref_transposed(ref_type)
+  allowed: list[cs.Constant] = []
+  tiled_dimensions = ref_type.shape[-2:]
+  swizzles = (128, 64, 32, None) if allow_unswizzled else (128, 64, 32)
+  for swizzle in swizzles:
+    swizzle_elems = (swizzle or 16) * 8 // bitwidth
     tiling = (swizzle_elems, 8) if is_transposed else (8, swizzle_elems)
-    if any(s % t for s, t in zip(tiled_dimensions, tiling)):
-      continue
-    yield v, cs.SMEMTransforms(lc.TileTransform(tiling), swizzle)
+    if all(s % t == 0 for s, t in zip(tiled_dimensions, tiling)):
+      allowed.append(cs.SMEMTransforms(lc.TileTransform(tiling), swizzle))
+  if not allowed:
+    raise ValueError(f"No valid tiling found for {var}")
+  return cs.OneOf(var, tuple(allowed))
 
 
 def _divides_per_var(
@@ -459,8 +466,6 @@ def _extract_variable_assignments_from_constraints(
         yield var, layout
       case cs.Relayout(cs.RegisterLayout() as layout, cs.Variable() as var):
         yield var, layout
-      case cs.IsValidMmaTiling() as mma_tiling:
-        yield from _extract_layout_candidates_from_mma_tiling(mma_tiling)
       case cs.IsSupportedBroadcast(cs.RegisterLayout() as src, cs.Variable() as dst, dims=dims):
         yield from _extract_layout_candidates_from_broadcast(src, dst, dims)
       case cs.OneOf(expr=cs.Variable() as var, allowed=allowed_constants):
@@ -1140,13 +1145,8 @@ def _wgmma_constraint_system(
 
   b = ValueSite(op, VariableType.OPERAND, 2)
   b_var = ctx.producer_ref(b)
-  input_bitwidth = utils.bitwidth(op.b.type.element_type)
   b_is_transposed = utils.is_memref_transposed(ir.MemRefType(op.b.type))
-  constraints: list[cs.Constraint]
-  if b_is_transposed:
-    constraints = [cs.IsValidMmaTiling(cs.Transpose(b_var, (1, 0)), input_bitwidth)]
-  else:
-    constraints = [cs.IsValidMmaTiling(b_var, input_bitwidth)]
+  constraints = [mma_tiling_constraint(b_var)]
   value_sites_for_variable[b_var] = [b]
 
   a = ValueSite(op, VariableType.OPERAND, 1)
@@ -1629,11 +1629,7 @@ def _tcgen05_mma_constraint_system(
   b_var = ctx.producer_ref(b)
   operands_for_variable[b_var] = [b]
   b_is_transposed = utils.is_memref_transposed(ir.MemRefType(op.b.type))
-  constraints: list[cs.Constraint]
-  if b_is_transposed:
-    constraints = [cs.IsValidMmaTiling(cs.Transpose(b_var, (1, 0)), element_type_bitwidth)]
-  else:
-    constraints = [cs.IsValidMmaTiling(b_var, element_type_bitwidth)]
+  constraints = [mma_tiling_constraint(b_var)]
 
   # SMEM
   M = op.accumulator.type.shape[0]
@@ -1671,14 +1667,10 @@ def _tcgen05_mma_constraint_system(
       )
   else:
     assert _is_smem_ref(op.a)
-    a_is_transposed = utils.is_memref_transposed(ir.MemRefType(op.a.type))
     a = ValueSite(op, VariableType.OPERAND, 1)
     a_var = ctx.producer_ref(a)
     operands_for_variable[a_var] = [a]
-    if a_is_transposed:
-      constraints.append(cs.IsValidMmaTiling(cs.Transpose(a_var, (1, 0)), element_type_bitwidth))
-    else:
-      constraints.append(cs.IsValidMmaTiling(a_var, element_type_bitwidth))
+    constraints.append(mma_tiling_constraint(a_var))
 
   if (sparse_meta_operand := getattr(op, "a_sparse_metadata")) is not None:
     sparse_meta = ValueSite(
@@ -1794,7 +1786,7 @@ def _async_store_smem_to_tmem_constraint_system(
       cs.ConstraintSystem(
           assignments={destination_variable: tmem_layout},
           constraints=[
-              cs.IsValidMmaTiling(source_variable, bitwidth, allow_unswizzled=True)
+              mma_tiling_constraint(source_variable, allow_unswizzled=True)
           ],
       ),
       {source_variable: [source], destination_variable: [destination]},
@@ -2639,27 +2631,23 @@ def _check_unsatisfiable_divisibility_constraints(
       if isinstance(cst, cs.SMEMTransforms) and cst.tiling is not None:
         candidates_per_var[var].append(cst)
 
-  # We only look at candidates from `IsValidMmaTiling` because we assume
-  # candidates extracted from it are exhaustive. Semantically it allows us to
-  # raise an error message saying there's a problem with the kernel, and not
-  # the layout inference system itself.
-  # TODO(olechwierowicz): We might need to saturate `cs.IsValidMmaTiling` for
-  # equal variables to handle cases like:
+  # We only look at candidates from `OneOf` because we assume candidates
+  # extracted from it are exhaustive. Semantically it allows us to raise an
+  # error message saying there's a problem with the kernel, and not the layout
+  # inference system itself.
+  # TODO(olechwierowicz): We might need to saturate `cs.OneOf` for equal
+  # variables to handle cases like:
   #   async_load(gmem, smem)
   #   ...
   #   wgmma(acc, smem.at[0], ...)
   for constraint in system.constraints:
-    if isinstance(constraint, cs.IsValidMmaTiling):
-      for mma_var, candidate in _extract_layout_candidates_from_mma_tiling(
-          constraint
-      ):
-        if (
-            mma_var in candidates_per_var
-            and mma_var not in system.assignments
-            and isinstance(candidate, cs.SMEMTransforms)
-            and candidate.tiling is not None
-        ):
-          candidates_per_var[mma_var].append(candidate)
+    match constraint:
+      case cs.OneOf(expr=cs.Variable() as var, allowed=allowed):
+        if var not in candidates_per_var or var in system.assignments:
+          continue
+        for cand in allowed:
+          if isinstance(cand, cs.SMEMTransforms) and cand.tiling is not None:
+            candidates_per_var[var].append(cand)
 
   def _culprit_indices(tiling: tuple[int, ...], multiple: tuple[int, ...]):
     """Returns negative indices into the tiling for which the divisibility
