@@ -592,8 +592,12 @@ def _masked_cumop_lowering_rule(ctx: sc_lowering.LoweringRuleContext, x, mask,
         x.type, arith.constant(i32, ir.IntegerAttr.get(i32, 0x80000000)))
     x = arith.xori(x, sign_bit_vec)
   result = tpu.scan(
-      x.type, x, ir.Attribute.parse(f"#tpu.reduction_kind<{reduction_kind}>"),
-      mask=mask)
+      x.type,
+      x,
+      ir.Attribute.parse(f"#tpu.reduction_kind<{reduction_kind}>"),
+      mask=mask,
+      dimension=len(x.shape) - 1,
+  )
   if sign_bit_vec is not None:  # Flip the sign bit back
     return arith.xori(result, sign_bit_vec)
   return result
@@ -686,7 +690,12 @@ def _cumsum_lowering_rule(ctx: sc_lowering.LoweringRuleContext, x, axis,
   c1 = arith.constant(i1t, ir.IntegerAttr.get(i1t, 1))
   c1v = vector.broadcast(ir.VectorType.get(x.type.shape, c1.type), c1)
   return tpu.scan(
-      x.type, x, ir.Attribute.parse("#tpu.reduction_kind<sum>"), mask=c1v)
+      x.type,
+      x,
+      ir.Attribute.parse("#tpu.reduction_kind<sum>"),
+      mask=c1v,
+      dimension=len(x.shape) - 1,
+  )
 
 
 def cumsum(x: jax.Array, *, mask: jax.Array | None = None) -> jax.Array:
